@@ -32,11 +32,14 @@ if not TOKEN:
 if not WEBHOOK_URL:
     raise ValueError("❌ WEBHOOK_URL not set")
 
+logger.info(f"✅ CONFIG LOADED - Token: {TOKEN[:10]}... Webhook: {WEBHOOK_URL}")
+
 # ===================== FLASK APP =====================
 flask_app = Flask(__name__)
 
 # ===================== BOT APPLICATION (Global) =====================
 bot_app: Optional[Application] = None
+loop: Optional[asyncio.AbstractEventLoop] = None
 
 # ===================== STORAGE =====================
 def load_users() -> dict:
@@ -80,6 +83,7 @@ def get_user(user_id: int, users: dict) -> dict:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command - main menu"""
+    logger.info(f"📨 /start from {update.effective_user.first_name}")
     users = load_users()
     user = get_user(update.effective_user.id, users)
     
@@ -105,6 +109,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Help command"""
+    logger.info(f"📨 /help from {update.effective_user.first_name}")
     text = """🎮 *TokenArcade Commands*
 
 /start - Main menu
@@ -117,6 +122,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Check balance"""
+    logger.info(f"📨 /balance from {update.effective_user.first_name}")
     users = load_users()
     user = get_user(update.effective_user.id, users)
     level = (user['xp'] // 500) + 1
@@ -132,6 +138,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Daily bonus"""
+    logger.info(f"📨 /daily from {update.effective_user.first_name}")
     users = load_users()
     user = get_user(update.effective_user.id, users)
     today = datetime.now().date().isoformat()
@@ -148,6 +155,7 @@ async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def mines_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Play Mines"""
+    logger.info(f"📨 /mines from {update.effective_user.first_name}")
     if not context.args or len(context.args) < 2:
         await update.message.reply_text("Usage: `/mines 50 5`", parse_mode='Markdown')
         return
@@ -197,6 +205,7 @@ async def mines_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button presses"""
     query = update.callback_query
+    logger.info(f"🔘 Button: {query.data} from {query.from_user.first_name}")
     await query.answer()
     
     users = load_users()
@@ -247,22 +256,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text += f"{i}. User{uid[:3]} - `{u['coins']}`\n"
         await query.edit_message_text(text, parse_mode='Markdown')
 
-# ===================== ASYNC HELPER =====================
-
-def run_async(coro):
-    """Run async coroutine in sync context"""
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    return loop.run_until_complete(coro)
-
 # ===================== INITIALIZATION =====================
 
-async def init_bot_app() -> Application:
-    """Initialize the Telegram bot application"""
+async def init_bot_app_async() -> Application:
+    """Initialize bot app (async)"""
     global bot_app
     
     logger.info("🔧 Initializing Telegram Application...")
@@ -277,9 +274,21 @@ async def init_bot_app() -> Application:
     bot_app.add_handler(CommandHandler("mines", mines_cmd))
     bot_app.add_handler(CallbackQueryHandler(button_callback))
     
-    logger.info("✅ Telegram Application initialized successfully")
+    logger.info("✅ Handlers registered")
     
     return bot_app
+
+def init_bot_app() -> None:
+    """Initialize bot app (sync wrapper)"""
+    global bot_app, loop
+    
+    if bot_app is not None:
+        logger.info("⚠️  Bot already initialized")
+        return
+    
+    logger.info("🔄 Running async initialization...")
+    bot_app = loop.run_until_complete(init_bot_app_async())
+    logger.info(f"✅ Bot initialized: {bot_app}")
 
 # ===================== FLASK ROUTES =====================
 
@@ -290,20 +299,29 @@ def index():
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handle Telegram webhook (SYNC wrapper)"""
-    global bot_app
+    """Handle Telegram webhook"""
+    global bot_app, loop
     
     try:
-        # Initialize bot on first request
         if bot_app is None:
-            run_async(init_bot_app())
+            logger.error("❌ Bot not initialized!")
+            return 'Bot not ready', 503
         
         # Get update
         data = request.get_json()
-        update = Update.de_json(data, bot_app.bot)
+        if not data:
+            logger.warning("⚠️  Empty request body")
+            return '', 204
         
-        # Process update (async)
-        run_async(bot_app.process_update(update))
+        logger.info(f"📨 Received update: {data.get('update_id')}")
+        
+        update = Update.de_json(data, bot_app.bot)
+        if not update:
+            logger.warning("⚠️  Failed to parse update")
+            return '', 204
+        
+        # Process update
+        loop.run_until_complete(bot_app.process_update(update))
         
         return '', 204  # No content response
     
@@ -313,30 +331,40 @@ def webhook():
 
 # ===================== STARTUP =====================
 
-def startup():
-    """Run on application startup"""
-    global bot_app
+def set_webhook():
+    """Set webhook with Telegram"""
+    global bot_app, loop
     
-    if bot_app is None:
-        run_async(init_bot_app())
-    
-    # Set webhook with Telegram
     try:
-        run_async(bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
-        logger.info(f"✅ Webhook set to {WEBHOOK_URL}/webhook")
+        if bot_app is None:
+            logger.error("❌ Cannot set webhook: bot not initialized")
+            return
+        
+        logger.info(f"🔗 Setting webhook to {WEBHOOK_URL}/webhook")
+        loop.run_until_complete(bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
+        logger.info(f"✅ Webhook set successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to set webhook: {e}")
+        logger.error(f"❌ Failed to set webhook: {e}", exc_info=True)
 
 # ===================== MAIN =====================
 
 if __name__ == '__main__':
-    logger.info(f"🚀 Starting TokenArcade Bot on port {PORT}")
-    logger.info(f"📱 Webhook: {WEBHOOK_URL}/webhook")
+    # Create event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Startup
-    startup()
+    logger.info(f"🚀 Starting TokenArcade Bot")
+    logger.info(f"📱 Webhook URL: {WEBHOOK_URL}/webhook")
+    logger.info(f"🔑 Token: {TOKEN[:15]}...")
+    
+    # Initialize bot
+    init_bot_app()
+    
+    # Set webhook
+    set_webhook()
     
     # Run Flask
+    logger.info(f"🚀 Running Flask on 0.0.0.0:{PORT}")
     flask_app.run(
         host='0.0.0.0',
         port=PORT,
