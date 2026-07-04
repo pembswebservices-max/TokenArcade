@@ -35,8 +35,7 @@ if not WEBHOOK_URL:
 # ===================== FLASK APP =====================
 flask_app = Flask(__name__)
 
-# ===================== BOT APPLICATION =====================
-# This is initialized once per process
+# ===================== BOT APPLICATION (Global) =====================
 bot_app: Optional[Application] = None
 
 # ===================== STORAGE =====================
@@ -248,6 +247,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text += f"{i}. User{uid[:3]} - `{u['coins']}`\n"
         await query.edit_message_text(text, parse_mode='Markdown')
 
+# ===================== ASYNC HELPER =====================
+
+def run_async(coro):
+    """Run async coroutine in sync context"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(coro)
+
 # ===================== INITIALIZATION =====================
 
 async def init_bot_app() -> Application:
@@ -278,21 +289,21 @@ def index():
     return '✅ TokenArcade Bot is running', 200
 
 @flask_app.route('/webhook', methods=['POST'])
-async def webhook():
-    """Handle Telegram webhook"""
+def webhook():
+    """Handle Telegram webhook (SYNC wrapper)"""
     global bot_app
     
     try:
         # Initialize bot on first request
         if bot_app is None:
-            await init_bot_app()
+            run_async(init_bot_app())
         
         # Get update
         data = request.get_json()
         update = Update.de_json(data, bot_app.bot)
         
-        # Process update
-        await bot_app.process_update(update)
+        # Process update (async)
+        run_async(bot_app.process_update(update))
         
         return '', 204  # No content response
     
@@ -302,28 +313,19 @@ async def webhook():
 
 # ===================== STARTUP =====================
 
-async def on_startup():
+def startup():
     """Run on application startup"""
     global bot_app
     
     if bot_app is None:
-        await init_bot_app()
+        run_async(init_bot_app())
     
     # Set webhook with Telegram
     try:
-        await bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+        run_async(bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"))
         logger.info(f"✅ Webhook set to {WEBHOOK_URL}/webhook")
     except Exception as e:
         logger.error(f"❌ Failed to set webhook: {e}")
-
-# ===================== ASGI WRAPPER =====================
-
-@flask_app.before_request
-def before_request():
-    """Initialize on first request"""
-    if flask_app.config.get('startup_done') is None:
-        asyncio.run(on_startup())
-        flask_app.config['startup_done'] = True
 
 # ===================== MAIN =====================
 
@@ -331,9 +333,14 @@ if __name__ == '__main__':
     logger.info(f"🚀 Starting TokenArcade Bot on port {PORT}")
     logger.info(f"📱 Webhook: {WEBHOOK_URL}/webhook")
     
+    # Startup
+    startup()
+    
+    # Run Flask
     flask_app.run(
         host='0.0.0.0',
         port=PORT,
         debug=False,
-        use_reloader=False
+        use_reloader=False,
+        threaded=True
     )
